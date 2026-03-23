@@ -55,13 +55,28 @@ def _set_setup(context: ContextTypes.DEFAULT_TYPE, data: dict) -> None:
     context.user_data[SETUP_KEY] = data
 
 
+async def _get_admin_groups(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    """Return only groups where the user is an admin or owner."""
+    from telegram import ChatMember
+    all_groups = get_all_groups()
+    admin_groups = []
+    for g in all_groups:
+        try:
+            member = await context.bot.get_chat_member(g["id"], user_id)
+            if member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+                admin_groups.append(g)
+        except Exception:
+            pass
+    return admin_groups
+
+
 async def setup_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if update.effective_chat.type != "private":
         await update.message.reply_text("Please use /setup in a DM with me.")
         return ConversationHandler.END
 
-    # Find groups where this bot is present
-    all_groups = get_all_groups()
+    # Find groups where this user is an admin
+    all_groups = await _get_admin_groups(update.effective_user.id, context)
     if not all_groups:
         await update.message.reply_text(
             "I'm not added to any groups yet. Add me to a group first, then come back and run /setup."

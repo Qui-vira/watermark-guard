@@ -169,13 +169,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _get_admin_groups(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    """Return only groups where the user is an admin or owner."""
+    from database import get_all_groups
+    all_groups = get_all_groups()
+    admin_groups = []
+    for g in all_groups:
+        try:
+            member = await context.bot.get_chat_member(g["id"], user_id)
+            if member.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER):
+                admin_groups.append(g)
+        except Exception:
+            pass
+    return admin_groups
+
+
 async def cmd_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != "private":
         return
 
-    from database import get_all_groups
-
-    groups = get_all_groups()
+    groups = await _get_admin_groups(update.effective_user.id, context)
     if not groups:
         await update.message.reply_text("No groups configured yet. Add me to a group first.")
         return
@@ -201,9 +214,7 @@ async def cmd_preview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if update.effective_chat.type != "private":
         return
 
-    from database import get_all_groups
-
-    groups = get_all_groups()
+    groups = await _get_admin_groups(update.effective_user.id, context)
     if not groups:
         await update.message.reply_text("No groups configured yet.")
         return

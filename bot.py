@@ -90,17 +90,33 @@ async def _can_delete(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
 
 
 def _format_config(group: dict) -> str:
+    wm_type = group.get("watermark_type", "not set")
     lines = [
         f"*Group:* {group.get('title', 'Unknown')}",
-        f"*Type:* {group.get('watermark_type', 'not set')}",
-        f"*Text:* {group.get('watermark_text') or '—'}",
-        f"*URL:* {group.get('watermark_url') or '—'}",
-        f"*Use channel name:* {'Yes' if group.get('use_channel_name') else 'No'}",
-        f"*Position:* {group.get('watermark_position', 'bottom-right')}",
-        f"*Rotation:* {group.get('watermark_rotation', 0)}°",
-        f"*Logo:* {'Uploaded' if group.get('logo_path') else '—'}",
-        f"*Active:* {'Yes' if group.get('is_active', True) else 'No'}",
+        f"*Type:* {wm_type}",
     ]
+    if wm_type == "template":
+        lines += [
+            f"*Brand:* {group.get('brand_name') or '—'}",
+            f"*Accent:* {group.get('accent_color') or '#00CCFF'}",
+            f"*Stars:* {'★' * (group.get('star_rating') or 0)}",
+            f"*Tagline:* {group.get('template_tagline') or '—'}",
+            f"*WhatsApp:* {group.get('contact_whatsapp') or '—'}",
+            f"*Telegram:* {group.get('contact_telegram') or '—'}",
+            f"*Instagram:* {group.get('contact_instagram') or '—'}",
+            f"*LinkedIn:* {group.get('contact_linkedin') or '—'}",
+            f"*Logo:* {'Uploaded' if group.get('logo_path') else '—'}",
+        ]
+    else:
+        lines += [
+            f"*Text:* {group.get('watermark_text') or '—'}",
+            f"*URL:* {group.get('watermark_url') or '—'}",
+            f"*Use channel name:* {'Yes' if group.get('use_channel_name') else 'No'}",
+            f"*Position:* {group.get('watermark_position', 'bottom-right')}",
+            f"*Rotation:* {group.get('watermark_rotation', 0)}°",
+            f"*Logo:* {'Uploaded' if group.get('logo_path') else '—'}",
+        ]
+    lines.append(f"*Active:* {'Yes' if group.get('is_active', True) else 'No'}")
     return "\n".join(lines)
 
 

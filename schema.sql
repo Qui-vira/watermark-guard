@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS wg_groups (
     id BIGINT PRIMARY KEY,  -- Telegram chat_id
     title TEXT NOT NULL,
-    watermark_type TEXT CHECK (watermark_type IN ('text', 'logo', 'both')),
+    watermark_type TEXT CHECK (watermark_type IN ('text', 'logo', 'both', 'template')),
     watermark_text TEXT,
     watermark_url TEXT,
     watermark_position TEXT DEFAULT 'bottom-right' CHECK (watermark_position IN ('center', 'bottom-right', 'bottom-left', 'top-right', 'top-left', 'banner')),
@@ -12,6 +12,14 @@ CREATE TABLE IF NOT EXISTS wg_groups (
     use_channel_name BOOLEAN DEFAULT FALSE,
     logo_path TEXT,
     is_active BOOLEAN DEFAULT TRUE,
+    accent_color TEXT DEFAULT '#00CCFF',
+    brand_name TEXT,
+    contact_whatsapp TEXT,
+    contact_telegram TEXT,
+    contact_instagram TEXT,
+    contact_linkedin TEXT,
+    template_tagline TEXT,
+    star_rating INTEGER DEFAULT 5,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );

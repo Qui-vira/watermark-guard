@@ -4,7 +4,20 @@ import io
 import logging
 import os
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
-from config import FONT_PATH, SAMPLE_IMAGE_SIZE, SAMPLE_IMAGE_COLOR
+from config import (
+    FONT_PATH,
+    FONT_BOLD_PATH,
+    SAMPLE_IMAGE_SIZE,
+    SAMPLE_IMAGE_COLOR,
+    TEMPLATE_CANVAS_WIDTH,
+    TEMPLATE_PADDING,
+    TEMPLATE_HEADER_HEIGHT,
+    TEMPLATE_FOOTER_HEIGHT,
+    TEMPLATE_IMAGE_BORDER,
+    TEMPLATE_BG_TOP,
+    TEMPLATE_BG_BOTTOM,
+    TEMPLATE_DEFAULT_ACCENT,
+)
 from database import download_logo
 
 logger = logging.getLogger(__name__)
@@ -27,6 +40,19 @@ if _RESOLVED_FONT:
     logger.info(f"Font found at: {_RESOLVED_FONT}")
 else:
     logger.warning("No font file found in any search path")
+
+# Resolve bold font
+_RESOLVED_BOLD_FONT = None
+_BOLD_FONT_SEARCH_PATHS = [
+    FONT_BOLD_PATH,
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "DejaVuSans-Bold.ttf"),
+    "/app/fonts/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+]
+for _p in _BOLD_FONT_SEARCH_PATHS:
+    if os.path.isfile(_p):
+        _RESOLVED_BOLD_FONT = _p
+        break
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
@@ -126,11 +152,205 @@ def _render_logo_layer(
     return _rotate_element(logo, angle)
 
 
+def _load_bold_font(size: int) -> ImageFont.FreeTypeFont:
+    if _RESOLVED_BOLD_FONT:
+        try:
+            return ImageFont.truetype(_RESOLVED_BOLD_FONT, size)
+        except OSError:
+            pass
+    return _load_font(size)
+
+
+def _hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+    hex_color = hex_color.lstrip("#")
+    if len(hex_color) != 6:
+        hex_color = "00CCFF"
+    return tuple(int(hex_color[i : i + 2], 16) for i in (0, 2, 4))
+
+
+def _draw_gradient(draw: ImageDraw.Draw, width: int, height: int,
+                   top_color: tuple, bottom_color: tuple) -> None:
+    for y in range(height):
+        ratio = y / max(height - 1, 1)
+        r = int(top_color[0] + (bottom_color[0] - top_color[0]) * ratio)
+        g = int(top_color[1] + (bottom_color[1] - top_color[1]) * ratio)
+        b = int(top_color[2] + (bottom_color[2] - top_color[2]) * ratio)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+
+
+def apply_template(image_bytes: bytes, config: dict) -> bytes:
+    """Wrap an image in a branded template frame."""
+    accent_hex = config.get("accent_color") or TEMPLATE_DEFAULT_ACCENT
+    accent = _hex_to_rgb(accent_hex)
+    brand_name = config.get("brand_name") or config.get("title") or "BRAND"
+    tagline = config.get("template_tagline") or ""
+    stars = config.get("star_rating", 5)
+    if stars is None:
+        stars = 5
+
+    # Contact info
+    contacts = []
+    if config.get("contact_whatsapp"):
+        contacts.append(f"WA: {config['contact_whatsapp']}")
+    if config.get("contact_telegram"):
+        contacts.append(f"TG: {config['contact_telegram']}")
+    if config.get("contact_instagram"):
+        contacts.append(f"IG: {config['contact_instagram']}")
+    if config.get("contact_linkedin"):
+        contacts.append(f"LI: {config['contact_linkedin']}")
+    contact_line = "  |  ".join(contacts)
+
+    pad = TEMPLATE_PADDING
+    cw = TEMPLATE_CANVAS_WIDTH
+    inner_w = cw - pad * 2  # area for image
+
+    # Load and scale the posted image to fit the inner width
+    posted = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    scale = inner_w / posted.width
+    posted_w = inner_w
+    posted_h = int(posted.height * scale)
+    posted = posted.resize((posted_w, posted_h), Image.LANCZOS)
+
+    # Calculate dynamic canvas height
+    header_h = TEMPLATE_HEADER_HEIGHT
+    border = TEMPLATE_IMAGE_BORDER
+    tagline_h = 50 if tagline else 0
+    footer_h = TEMPLATE_FOOTER_HEIGHT if contact_line else 0
+    line_gap = 20  # spacing for accent lines
+
+    canvas_h = (
+        pad +           # top padding
+        header_h +      # header with brand + stars
+        line_gap +      # accent line + gap
+        border * 2 +    # image border
+        posted_h +      # image
+        line_gap +      # gap
+        tagline_h +     # tagline
+        line_gap +      # accent line + gap
+        footer_h +      # contacts
+        pad             # bottom padding
+    )
+
+    # Create canvas with gradient background
+    canvas = Image.new("RGB", (cw, canvas_h))
+    draw = ImageDraw.Draw(canvas)
+    _draw_gradient(draw, cw, canvas_h, TEMPLATE_BG_TOP, TEMPLATE_BG_BOTTOM)
+
+    # Fonts
+    brand_font = _load_bold_font(32)
+    star_font = _load_font(28)
+    tagline_font = _load_font(20)
+    contact_font = _load_font(16)
+
+    y_cursor = pad
+
+    # ── Header: Logo + Brand Name + Stars ──
+    logo_offset_x = pad
+    # Try to draw small logo in header
+    logo_path = config.get("logo_path")
+    if logo_path:
+        try:
+            logo_bytes = download_logo(logo_path)
+            logo_img = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+            logo_size = header_h - 16
+            logo_ratio = logo_size / max(logo_img.width, logo_img.height)
+            lw = int(logo_img.width * logo_ratio)
+            lh = int(logo_img.height * logo_ratio)
+            logo_img = logo_img.resize((lw, lh), Image.LANCZOS)
+            logo_y = y_cursor + (header_h - lh) // 2
+            canvas.paste(logo_img, (pad, logo_y), logo_img)
+            logo_offset_x = pad + lw + 12
+        except Exception:
+            logger.warning("Failed to load logo for template header")
+
+    # Brand name
+    brand_bbox = draw.textbbox((0, 0), brand_name.upper(), font=brand_font)
+    brand_text_h = brand_bbox[3] - brand_bbox[1]
+    brand_y = y_cursor + (header_h - brand_text_h) // 2
+    draw.text((logo_offset_x, brand_y), brand_name.upper(), font=brand_font, fill=(255, 255, 255))
+
+    # Stars on the right
+    star_text = "★" * stars + "☆" * (5 - stars)
+    star_bbox = draw.textbbox((0, 0), star_text, font=star_font)
+    star_w = star_bbox[2] - star_bbox[0]
+    star_y = y_cursor + (header_h - (star_bbox[3] - star_bbox[1])) // 2
+    draw.text((cw - pad - star_w, star_y), star_text, font=star_font, fill=accent)
+
+    y_cursor += header_h
+
+    # ── Accent line under header ──
+    draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
+    y_cursor += line_gap
+
+    # ── Framed image with accent border ──
+    img_x = pad - border
+    img_y = y_cursor - border
+    # Draw border rectangle
+    draw.rectangle(
+        [img_x, img_y, img_x + posted_w + border * 2, img_y + posted_h + border * 2],
+        outline=accent, width=border,
+    )
+    canvas.paste(posted.convert("RGB"), (pad, y_cursor))
+
+    # Corner L-bracket accents (top-left, top-right, bottom-left, bottom-right)
+    bracket_len = 30
+    bw = 3
+    corners = [
+        (img_x, img_y),                                           # top-left
+        (img_x + posted_w + border * 2, img_y),                   # top-right
+        (img_x, img_y + posted_h + border * 2),                   # bottom-left
+        (img_x + posted_w + border * 2, img_y + posted_h + border * 2),  # bottom-right
+    ]
+    for i, (cx, cy) in enumerate(corners):
+        dx = 1 if i % 2 == 0 else -1
+        dy = 1 if i < 2 else -1
+        draw.line([(cx, cy), (cx + dx * bracket_len, cy)], fill=accent, width=bw)
+        draw.line([(cx, cy), (cx, cy + dy * bracket_len)], fill=accent, width=bw)
+
+    y_cursor += posted_h + border * 2 + line_gap
+
+    # ── Tagline ──
+    if tagline:
+        tl_bbox = draw.textbbox((0, 0), f'"{tagline}"', font=tagline_font)
+        tl_w = tl_bbox[2] - tl_bbox[0]
+        draw.text(
+            ((cw - tl_w) // 2, y_cursor),
+            f'"{tagline}"',
+            font=tagline_font,
+            fill=(220, 220, 220),
+        )
+        y_cursor += tagline_h
+
+    # ── Accent line above footer ──
+    if contact_line:
+        draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
+        y_cursor += line_gap
+
+        # ── Contact footer ──
+        ct_bbox = draw.textbbox((0, 0), contact_line, font=contact_font)
+        ct_w = ct_bbox[2] - ct_bbox[0]
+        draw.text(
+            ((cw - ct_w) // 2, y_cursor),
+            contact_line,
+            font=contact_font,
+            fill=accent,
+        )
+
+    output = io.BytesIO()
+    canvas.save(output, format="JPEG", quality=95)
+    return output.getvalue()
+
+
 def apply_watermark(image_bytes: bytes, config: dict) -> bytes:
+    wm_type = config.get("watermark_type", "text")
+
+    # Route to template engine if type is template
+    if wm_type == "template":
+        return apply_template(image_bytes, config)
+
     img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
     w, h = img.size
 
-    wm_type = config.get("watermark_type", "text")
     position = config.get("watermark_position", "bottom-right")
     angle = config.get("watermark_rotation", 0)
 

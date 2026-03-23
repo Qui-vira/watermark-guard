@@ -401,12 +401,59 @@ async def _process_single_image(
         update_pending_image(pending_id, {"status": "rejected"})
 
 
+async def on_channel_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle images posted in channels — auto-watermark without approval since only admins post."""
+    message = update.channel_post or update.effective_message
+    if not message:
+        return
+
+    chat = message.chat
+    if chat.type != "channel":
+        return
+
+    if not _check_rate_limit(chat.id):
+        logger.warning(f"Rate limit hit for channel {chat.id}")
+        return
+
+    group = get_group(chat.id)
+    if not group or not group.get("watermark_type") or not group.get("is_active", True):
+        return
+
+    # Extract file_id and caption
+    caption = message.caption
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document:
+        file_id = message.document.file_id
+    else:
+        return
+
+    # Delete original
+    try:
+        await context.bot.delete_message(chat.id, message.message_id)
+    except BadRequest:
+        logger.warning(f"Cannot delete message in channel {chat.id}")
+        return
+
+    # Download and watermark
+    file = await context.bot.get_file(file_id)
+    file_bytes = await file.download_as_bytearray()
+    watermarked_bytes = apply_watermark(bytes(file_bytes), group)
+
+    # Post watermarked image directly (no approval needed for channels)
+    await context.bot.send_photo(
+        chat_id=chat.id,
+        photo=watermarked_bytes,
+        caption=caption,
+    )
+
+
 async def on_group_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
 
-    if chat.type == "private":
+    if chat.type == "private" or chat.type == "channel":
         return
 
     # Rate limit
@@ -416,19 +463,21 @@ async def on_group_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # Check delete permission
     if not await _can_delete(chat.id, context):
-        try:
-            await context.bot.send_message(
-                user.id,
-                f"I need 'Delete Messages' permission in *{chat.title}*.",
-                parse_mode="Markdown",
-            )
-        except Exception:
-            pass
+        if user:
+            try:
+                await context.bot.send_message(
+                    user.id,
+                    f"I need 'Delete Messages' permission in *{chat.title}*.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
         return
 
     # Extract file_id and caption
     caption = message.caption
-    username = user.username
+    username = user.username if user else None
+    user_id = user.id if user else 0
 
     if message.media_group_id:
         # Media group handling
@@ -447,7 +496,7 @@ async def on_group_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             {
                 "file_id": file_id,
                 "caption": caption,
-                "user_id": user.id,
+                "user_id": user_id,
                 "username": username,
                 "message_id": message.message_id,
                 "chat_id": chat.id,
@@ -487,7 +536,7 @@ async def on_group_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     await _process_single_image(
-        update, context, file_id, caption, chat.id, user.id, username, message.message_id
+        update, context, file_id, caption, chat.id, user_id, username, message.message_id
     )
 
 
@@ -688,6 +737,15 @@ def main() -> None:
             (filters.PHOTO | filters.Document.IMAGE)
             & (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP),
             on_group_image,
+        )
+    )
+
+    # Channel post handler — auto-watermark without approval
+    app.add_handler(
+        MessageHandler(
+            (filters.PHOTO | filters.Document.IMAGE)
+            & filters.UpdateType.CHANNEL_POST,
+            on_channel_image,
         )
     )
 

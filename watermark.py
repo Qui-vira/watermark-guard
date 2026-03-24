@@ -178,10 +178,120 @@ def _draw_gradient(draw: ImageDraw.Draw, width: int, height: int,
         draw.line([(0, y), (width, y)], fill=(r, g, b))
 
 
+def _fit_cover(img: Image.Image, target_w: int, target_h: int) -> Image.Image:
+    """Resize image to cover target dimensions, cropping excess."""
+    img_ratio = img.width / img.height
+    target_ratio = target_w / target_h
+    if img_ratio > target_ratio:
+        new_h = target_h
+        new_w = int(target_h * img_ratio)
+    else:
+        new_w = target_w
+        new_h = int(target_w / img_ratio)
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+    left = (new_w - target_w) // 2
+    top = (new_h - target_h) // 2
+    return img.crop((left, top, left + target_w, top + target_h))
+
+
+def _apply_vignette(canvas: Image.Image, strength: int = 80) -> Image.Image:
+    """Darken edges with radial vignette effect."""
+    w, h = canvas.size
+    vig = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    vd = ImageDraw.Draw(vig)
+    for i in range(strength):
+        alpha = int((strength - i) * 2.5)
+        margin = i * max(w, h) // (strength * 2)
+        vd.rectangle([0, 0, w, margin], fill=(0, 0, 0, alpha))
+        vd.rectangle([0, h - margin, w, h], fill=(0, 0, 0, alpha))
+        vd.rectangle([0, 0, margin, h], fill=(0, 0, 0, alpha))
+        vd.rectangle([w - margin, 0, w, h], fill=(0, 0, 0, alpha))
+    return Image.alpha_composite(canvas.convert("RGBA"), vig).convert("RGB")
+
+
+def _apply_gradient_orbs(canvas: Image.Image, accent: tuple) -> Image.Image:
+    """Add soft accent-colored orbs for ambient depth."""
+    w, h = canvas.size
+    orb_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    orb_draw = ImageDraw.Draw(orb_layer)
+    positions = [(int(w * 0.2), int(h * 0.25)), (int(w * 0.8), int(h * 0.75))]
+    radius = min(w, h) // 4
+    for ox, oy in positions:
+        for r in range(radius, 0, -2):
+            alpha = int(20 * (r / radius))
+            orb_draw.ellipse(
+                [ox - r, oy - r, ox + r, oy + r],
+                fill=(*accent, alpha),
+            )
+    orb_layer = orb_layer.filter(ImageFilter.GaussianBlur(radius // 3))
+    return Image.alpha_composite(canvas.convert("RGBA"), orb_layer).convert("RGB")
+
+
+def _draw_glow_text(canvas: Image.Image, text: str, x: int, y: int,
+                    font, color: tuple, blur: int = 8, alpha: int = 120) -> Image.Image:
+    """Draw text with a soft glow halo behind it."""
+    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.text((x, y), text, fill=(*color[:3], alpha), font=font)
+    glow = glow.filter(ImageFilter.GaussianBlur(blur))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), glow).convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+    draw.text((x, y), text, fill=(255, 255, 255), font=font)
+    return canvas
+
+
+def _draw_glow_line(canvas: Image.Image, start: tuple, end: tuple,
+                    color: tuple, width: int = 2) -> Image.Image:
+    """Draw accent line with soft glow behind it."""
+    glow = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+    gd = ImageDraw.Draw(glow)
+    gd.line([start, end], fill=(*color[:3], 80), width=width + 4)
+    glow = glow.filter(ImageFilter.GaussianBlur(6))
+    canvas = Image.alpha_composite(canvas.convert("RGBA"), glow).convert("RGB")
+    draw = ImageDraw.Draw(canvas)
+    draw.line([start, end], fill=color, width=width)
+    return canvas
+
+
+def _create_ai_canvas(bg_path: str, width: int, height: int, accent: tuple) -> Image.Image:
+    """Build premium canvas: AI bg + dark overlay + vignette + gradient orbs."""
+    from ai_background import download_ai_background
+    bg_bytes = download_ai_background(bg_path)
+    bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+    bg = _fit_cover(bg, width, height)
+    # Dark overlay ~60%
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 155))
+    canvas = Image.alpha_composite(bg.convert("RGBA"), overlay).convert("RGB")
+    canvas = _apply_vignette(canvas)
+    canvas = _apply_gradient_orbs(canvas, accent)
+    return canvas
+
+
+def _draw_glass_panel(canvas: Image.Image, x: int, y: int, w: int, h: int,
+                      accent: tuple) -> Image.Image:
+    """Draw a glass-morphism panel with drop shadow."""
+    canvas_rgba = canvas.convert("RGBA")
+    margin = 8
+    # Drop shadow
+    shadow = Image.new("RGBA", (w + margin * 2 + 10, h + margin * 2 + 10), (0, 0, 0, 0))
+    shadow_draw = ImageDraw.Draw(shadow)
+    shadow_draw.rectangle([5, 5, shadow.width - 5, shadow.height - 5], fill=(0, 0, 0, 50))
+    shadow = shadow.filter(ImageFilter.GaussianBlur(8))
+    canvas_rgba.paste(shadow, (x - margin - 5, y - margin - 5), shadow)
+    # Glass panel
+    panel = Image.new("RGBA", (w + margin * 2, h + margin * 2), (255, 255, 255, 15))
+    panel_draw = ImageDraw.Draw(panel)
+    panel_draw.rectangle([0, 0, panel.width - 1, panel.height - 1],
+                         outline=(*accent, 60), width=2)
+    canvas_rgba.paste(panel, (x - margin, y - margin), panel)
+    return canvas_rgba.convert("RGB")
+
+
 def apply_template(image_bytes: bytes, config: dict) -> bytes:
     """Wrap an image in a branded template frame."""
     accent_hex = config.get("accent_color") or TEMPLATE_DEFAULT_ACCENT
     accent = _hex_to_rgb(accent_hex)
+    has_ai_bg = bool(config.get("template_bg_path"))
     brand_name = config.get("brand_name") or config.get("title") or "BRAND"
     tagline = config.get("template_tagline") or ""
     stars = config.get("star_rating", 5)
@@ -231,10 +341,20 @@ def apply_template(image_bytes: bytes, config: dict) -> bytes:
         pad             # bottom padding
     )
 
-    # Create canvas with gradient background
-    canvas = Image.new("RGB", (cw, canvas_h))
-    draw = ImageDraw.Draw(canvas)
-    _draw_gradient(draw, cw, canvas_h, TEMPLATE_BG_TOP, TEMPLATE_BG_BOTTOM)
+    # Create canvas — AI background or gradient fallback
+    if has_ai_bg:
+        try:
+            canvas = _create_ai_canvas(config["template_bg_path"], cw, canvas_h, accent)
+        except Exception:
+            logger.warning("Failed to load AI background, falling back to gradient")
+            canvas = Image.new("RGB", (cw, canvas_h))
+            draw = ImageDraw.Draw(canvas)
+            _draw_gradient(draw, cw, canvas_h, TEMPLATE_BG_TOP, TEMPLATE_BG_BOTTOM)
+            has_ai_bg = False
+    else:
+        canvas = Image.new("RGB", (cw, canvas_h))
+        draw = ImageDraw.Draw(canvas)
+        _draw_gradient(draw, cw, canvas_h, TEMPLATE_BG_TOP, TEMPLATE_BG_BOTTOM)
 
     # Fonts
     brand_font = _load_bold_font(32)
@@ -263,43 +383,63 @@ def apply_template(image_bytes: bytes, config: dict) -> bytes:
         except Exception:
             logger.warning("Failed to load logo for template header")
 
-    # Brand name
+    # Brand name — with glow on AI backgrounds
+    draw = ImageDraw.Draw(canvas)
     brand_bbox = draw.textbbox((0, 0), brand_name.upper(), font=brand_font)
     brand_text_h = brand_bbox[3] - brand_bbox[1]
     brand_y = y_cursor + (header_h - brand_text_h) // 2
-    draw.text((logo_offset_x, brand_y), brand_name.upper(), font=brand_font, fill=(255, 255, 255))
+    if has_ai_bg:
+        canvas = _draw_glow_text(canvas, brand_name.upper(), logo_offset_x, brand_y,
+                                 brand_font, accent, blur=10, alpha=140)
+        draw = ImageDraw.Draw(canvas)
+    else:
+        draw.text((logo_offset_x, brand_y), brand_name.upper(), font=brand_font, fill=(255, 255, 255))
 
-    # Stars on the right
+    # Stars on the right — with glow on AI backgrounds
     star_text = "★" * stars + "☆" * (5 - stars)
     star_bbox = draw.textbbox((0, 0), star_text, font=star_font)
     star_w = star_bbox[2] - star_bbox[0]
     star_y = y_cursor + (header_h - (star_bbox[3] - star_bbox[1])) // 2
-    draw.text((cw - pad - star_w, star_y), star_text, font=star_font, fill=accent)
+    if has_ai_bg:
+        canvas = _draw_glow_text(canvas, star_text, cw - pad - star_w, star_y,
+                                 star_font, accent, blur=6, alpha=100)
+        draw = ImageDraw.Draw(canvas)
+    else:
+        draw.text((cw - pad - star_w, star_y), star_text, font=star_font, fill=accent)
 
     y_cursor += header_h
 
-    # ── Accent line under header ──
-    draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
+    # ── Accent line under header — with glow on AI backgrounds ──
+    if has_ai_bg:
+        canvas = _draw_glow_line(canvas, (pad, y_cursor), (cw - pad, y_cursor), accent)
+        draw = ImageDraw.Draw(canvas)
+    else:
+        draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
     y_cursor += line_gap
 
-    # ── Framed image with accent border ──
-    img_x = pad - border
-    img_y = y_cursor - border
-    # Draw border rectangle
-    draw.rectangle(
-        [img_x, img_y, img_x + posted_w + border * 2, img_y + posted_h + border * 2],
-        outline=accent, width=border,
-    )
+    # ── Framed image — glass panel on AI bg, simple border otherwise ──
+    if has_ai_bg:
+        canvas = _draw_glass_panel(canvas, pad, y_cursor, posted_w, posted_h, accent)
+        draw = ImageDraw.Draw(canvas)
+    else:
+        img_x = pad - border
+        img_y = y_cursor - border
+        draw.rectangle(
+            [img_x, img_y, img_x + posted_w + border * 2, img_y + posted_h + border * 2],
+            outline=accent, width=border,
+        )
     canvas.paste(posted.convert("RGB"), (pad, y_cursor))
 
-    # Corner L-bracket accents (top-left, top-right, bottom-left, bottom-right)
+    # Corner L-bracket accents
+    img_x = pad - border
+    img_y = y_cursor - border
     bracket_len = 30
     bw = 3
     corners = [
-        (img_x, img_y),                                           # top-left
-        (img_x + posted_w + border * 2, img_y),                   # top-right
-        (img_x, img_y + posted_h + border * 2),                   # bottom-left
-        (img_x + posted_w + border * 2, img_y + posted_h + border * 2),  # bottom-right
+        (img_x, img_y),
+        (img_x + posted_w + border * 2, img_y),
+        (img_x, img_y + posted_h + border * 2),
+        (img_x + posted_w + border * 2, img_y + posted_h + border * 2),
     ]
     for i, (cx, cy) in enumerate(corners):
         dx = 1 if i % 2 == 0 else -1
@@ -323,7 +463,11 @@ def apply_template(image_bytes: bytes, config: dict) -> bytes:
 
     # ── Accent line above footer ──
     if contact_line:
-        draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
+        if has_ai_bg:
+            canvas = _draw_glow_line(canvas, (pad, y_cursor), (cw - pad, y_cursor), accent)
+            draw = ImageDraw.Draw(canvas)
+        else:
+            draw.line([(pad, y_cursor), (cw - pad, y_cursor)], fill=accent, width=2)
         y_cursor += line_gap
 
         # ── Contact footer ──

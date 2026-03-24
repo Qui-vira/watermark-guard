@@ -9,6 +9,12 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 
+# AI & Payment keys
+FAL_KEY = os.environ.get("FAL_KEY", "")
+BLOCKRADAR_API_KEY = os.environ.get("BLOCKRADAR_API_KEY", "")
+BLOCKRADAR_WALLET_ID = os.environ.get("BLOCKRADAR_WALLET_ID", "")
+PORT = int(os.environ.get("PORT", 8080))
+
 # Constants
 WATERMARK_POSITIONS = ["center", "bottom-right", "bottom-left", "top-right", "top-left", "banner"]
 WATERMARK_TYPES = ["text", "logo", "both", "template"]
@@ -36,4 +42,22 @@ ACCENT_PRESETS = {
     "Lime": "#39FF14",
     "Red": "#FF3B3B",
     "Purple": "#A855F7",
+}
+
+# Pricing
+CREDIT_PRICE_USD = 0.60
+SUBSCRIPTION_PRICE_USD = 7.00
+SUBSCRIPTION_CREDITS = 15
+TRIAL_DAYS = 3
+
+# AI Background themes
+AI_THEMES = {
+    "crypto": "cryptocurrency blockchain digital finance futuristic neon circuits",
+    "luxury": "luxury premium elegant gold marble high-end fashion",
+    "tech": "technology circuits digital modern minimalist silicon",
+    "nature": "nature landscape mountains forest serene peaceful",
+    "abstract": "abstract geometric shapes colorful modern art fluid",
+    "dark": "dark moody cinematic noir shadows mysterious",
+    "neon": "neon lights cyberpunk city night glow electric",
+    "minimal": "minimalist clean simple elegant monochrome zen",
 }

@@ -30,6 +30,10 @@ from config import (
     APPROVAL_TIMEOUT_SECONDS,
     RATE_LIMIT_MAX,
     RATE_LIMIT_WINDOW,
+    PORT,
+    CREDIT_PRICE_USD,
+    SUBSCRIPTION_PRICE_USD,
+    SUBSCRIPTION_CREDITS,
 )
 from database import (
     upsert_group,
@@ -42,6 +46,19 @@ from database import (
 )
 from watermark import apply_watermark, generate_sample_image
 from setup_flow import build_setup_handler
+from billing import (
+    get_or_create_user,
+    is_trial_active,
+    has_active_subscription,
+    can_generate_ai_bg,
+    trial_expires_at,
+    create_payment,
+    get_expiring_trials,
+    get_low_credit_users,
+    get_expiring_subscriptions,
+)
+from payments import create_payment_link
+from webhook_server import create_web_app, set_bot_app
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
@@ -160,10 +177,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "1. Add me to your group/channel\n"
         "2. Make me an admin with 'Delete Messages' permission\n"
         "3. DM me /setup to configure your watermark\n\n"
-        "Commands:\n"
+        "*Commands:*\n"
         "/setup — Configure watermark\n"
         "/settings — View/edit current settings\n"
         "/preview — Preview watermark on a sample image\n"
+        "/buy — Purchase AI credits\n"
+        "/balance — Check credits & subscription\n"
+        "/subscribe — Monthly subscription\n"
         "/help — Show help",
         parse_mode="Markdown",
     )
@@ -238,12 +258,196 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/setup — Configure watermark for a group\n"
         "/settings — View/edit settings\n"
         "/preview — Preview watermark\n"
+        "/buy — Purchase AI background credits\n"
+        "/balance — Check credits & subscription\n"
+        "/subscribe — Monthly subscription ($7/mo)\n"
         "/help — This message\n\n"
         "*Group Commands (admin only):*\n"
         "/wm\\_status — Show watermark config\n"
         "/wm\\_toggle — Enable/disable watermarking",
         parse_mode="Markdown",
     )
+
+
+# ── Payment / credits commands ──
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        return
+    buttons = [
+        [InlineKeyboardButton(
+            f"1 Credit — ${CREDIT_PRICE_USD:.2f}",
+            callback_data="buy:credit_1",
+        )],
+        [InlineKeyboardButton(
+            f"5 Credits — ${CREDIT_PRICE_USD * 5:.2f}",
+            callback_data="buy:credit_5",
+        )],
+        [InlineKeyboardButton(
+            f"Monthly Sub ({SUBSCRIPTION_CREDITS} credits) — ${SUBSCRIPTION_PRICE_USD:.2f}",
+            callback_data="buy:subscription",
+        )],
+    ]
+    await update.message.reply_text(
+        "*Purchase AI Background Credits*\n\n"
+        "Each credit = 1 AI background generation.\n"
+        "Payments via crypto (USDC on BNB BEP20).",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def cmd_balance(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        return
+    user = get_or_create_user(update.effective_user.id)
+    lines = ["*Your Balance*\n"]
+
+    credits = user.get("credits", 0)
+    lines.append(f"Credits: *{credits}*")
+
+    if is_trial_active(user):
+        exp = trial_expires_at(user)
+        lines.append(f"Trial: *Active* (expires {exp.strftime('%b %d, %Y')})")
+    elif user.get("trial_start"):
+        lines.append("Trial: *Expired*")
+
+    if has_active_subscription(user):
+        sub_exp = user.get("subscription_expires", "")
+        used = user.get("monthly_credits_used", 0)
+        remaining = SUBSCRIPTION_CREDITS - used
+        lines.append(f"Subscription: *Active* ({remaining}/{SUBSCRIPTION_CREDITS} left)")
+    else:
+        lines.append("Subscription: *None*")
+
+    lines.append(f"\nUse /buy to purchase credits.")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != "private":
+        return
+    try:
+        link_data = create_payment_link(
+            SUBSCRIPTION_PRICE_USD, update.effective_user.id, "subscription"
+        )
+        create_payment(
+            user_id=update.effective_user.id,
+            amount=SUBSCRIPTION_PRICE_USD,
+            credits=SUBSCRIPTION_CREDITS,
+            payment_type="subscription",
+            blockradar_ref=link_data["reference"],
+        )
+        await update.message.reply_text(
+            f"*Monthly Subscription — ${SUBSCRIPTION_PRICE_USD:.2f}*\n\n"
+            f"{SUBSCRIPTION_CREDITS} AI background credits per month.\n\n"
+            f"Pay here: {link_data['url']}\n\n"
+            f"You'll be notified once payment is confirmed.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to create subscription link")
+        await update.message.reply_text("Error creating payment link. Please try again later.")
+
+
+async def buy_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+
+    user_id = update.effective_user.id
+
+    if choice == "subscription":
+        amount = SUBSCRIPTION_PRICE_USD
+        credits = SUBSCRIPTION_CREDITS
+        payment_type = "subscription"
+    elif choice == "credit_5":
+        amount = CREDIT_PRICE_USD * 5
+        credits = 5
+        payment_type = "credits"
+    else:
+        amount = CREDIT_PRICE_USD
+        credits = 1
+        payment_type = "credits"
+
+    try:
+        link_data = create_payment_link(amount, user_id, payment_type)
+        create_payment(
+            user_id=user_id,
+            amount=amount,
+            credits=credits,
+            payment_type=payment_type,
+            blockradar_ref=link_data["reference"],
+        )
+        await query.edit_message_text(
+            f"*Payment — ${amount:.2f}*\n\n"
+            f"{'Monthly subscription' if payment_type == 'subscription' else f'{credits} credit(s)'}\n\n"
+            f"Pay here: {link_data['url']}\n\n"
+            f"You'll be notified once payment is confirmed.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        logger.exception("Failed to create payment link")
+        await query.edit_message_text("Error creating payment link. Please try again with /buy.")
+
+
+# ── Notification jobs ──
+
+
+async def check_trial_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Notify users whose trial expires within 24 hours."""
+    try:
+        users = get_expiring_trials()
+    except Exception:
+        logger.exception("Failed to check expiring trials")
+        return
+    for u in users:
+        try:
+            await context.bot.send_message(
+                u["user_id"],
+                "Your WatermarkGuard free trial expires soon!\n"
+                "Use /buy to purchase credits or /subscribe for monthly access.",
+            )
+        except Exception:
+            pass
+
+
+async def check_low_credits(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Notify users with low credits."""
+    try:
+        users = get_low_credit_users()
+    except Exception:
+        logger.exception("Failed to check low credit users")
+        return
+    for u in users:
+        try:
+            credits = u.get("credits", 0)
+            await context.bot.send_message(
+                u["user_id"],
+                f"You have {credits} AI credit(s) remaining.\n"
+                f"Use /buy to top up or /subscribe for {SUBSCRIPTION_CREDITS} credits/month.",
+            )
+        except Exception:
+            pass
+
+
+async def check_subscription_expiry(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Notify users whose subscription expires within 3 days."""
+    try:
+        users = get_expiring_subscriptions()
+    except Exception:
+        logger.exception("Failed to check expiring subscriptions")
+        return
+    for u in users:
+        try:
+            await context.bot.send_message(
+                u["user_id"],
+                "Your WatermarkGuard subscription expires in 3 days.\n"
+                "Use /subscribe to renew.",
+            )
+        except Exception:
+            pass
 
 
 # ── Group commands ──
@@ -731,7 +935,9 @@ async def retry_local_queue(context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Main ──
 
 
-def main() -> None:
+async def main() -> None:
+    from aiohttp import web
+
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     # Setup conversation handler (must be added before generic handlers)
@@ -744,6 +950,9 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("settings", cmd_settings, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("preview", cmd_preview, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("buy", cmd_buy, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("balance", cmd_balance, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe, filters.ChatType.PRIVATE))
     app.add_handler(CommandHandler("help", cmd_help))
 
     # Group commands
@@ -753,6 +962,9 @@ def main() -> None:
     # Settings callbacks
     app.add_handler(CallbackQueryHandler(toggle_group_cb, pattern=r"^toggle_group:"))
     app.add_handler(CallbackQueryHandler(edit_group_cb, pattern=r"^edit_group:"))
+
+    # Purchase callbacks
+    app.add_handler(CallbackQueryHandler(buy_cb, pattern=r"^buy:"))
 
     # Approval callbacks
     app.add_handler(CallbackQueryHandler(approve_cb, pattern=r"^approve:"))
@@ -780,10 +992,39 @@ def main() -> None:
     job_queue = app.job_queue
     job_queue.run_repeating(expire_pending_images, interval=300, first=60)
     job_queue.run_repeating(retry_local_queue, interval=120, first=30)
+    job_queue.run_repeating(check_trial_expiry, interval=3600, first=300)
+    job_queue.run_repeating(check_low_credits, interval=3600, first=600)
+    job_queue.run_repeating(check_subscription_expiry, interval=3600, first=900)
 
-    logger.info("WatermarkGuard starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Initialize bot application
+    await app.initialize()
+    await app.start()
+
+    # Give webhook server access to the bot for notifications
+    set_bot_app(app)
+
+    # Start Telegram polling
+    await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("WatermarkGuard bot polling started")
+
+    # Start aiohttp webhook server
+    web_app = create_web_app()
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info(f"Webhook server listening on port {PORT}")
+
+    # Block forever
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

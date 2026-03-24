@@ -13,7 +13,7 @@ from telegram.ext import (
 )
 from database import get_group, update_group, upload_logo, get_all_groups
 from watermark import apply_watermark, generate_sample_image
-from config import WATERMARK_POSITIONS, ROTATION_OPTIONS, ACCENT_PRESETS
+from config import WATERMARK_POSITIONS, ROTATION_OPTIONS, ACCENT_PRESETS, AI_THEMES
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,10 @@ logger = logging.getLogger(__name__)
     TPL_CONTACT_IG,
     TPL_CONTACT_LI,
     TPL_CONFIRM_PREVIEW,
-) = range(21)
+    # AI background states
+    TPL_THEME_SELECT,
+    TPL_AI_CONFIRM,
+) = range(23)
 
 # Temporary config storage key
 SETUP_KEY = "setup_config"
@@ -454,7 +457,7 @@ async def tpl_accent_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return TPL_ACCENT_CUSTOM
 
     setup["accent_color"] = value
-    return await _ask_stars(update, context)
+    return await _ask_theme(update, context)
 
 
 async def tpl_accent_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -466,6 +469,148 @@ async def tpl_accent_custom(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await update.message.reply_text("Invalid hex code. Send a 6-digit hex like #FF5500:")
         return TPL_ACCENT_CUSTOM
     setup["accent_color"] = f"#{clean.upper()}"
+    return await _ask_theme(update, context)
+
+
+# ── AI Background theme selection ──
+
+
+async def _ask_theme(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Show AI background theme options or free gradient."""
+    buttons = [[InlineKeyboardButton("Free (Gradient)", callback_data="theme:free")]]
+    row = []
+    for theme_name in AI_THEMES:
+        row.append(InlineKeyboardButton(theme_name.title(), callback_data=f"theme:{theme_name}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    text = (
+        "Choose a background style:\n\n"
+        "Free — Classic gradient background\n"
+        "AI Themes — Premium cinematic AI-generated backgrounds"
+    )
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    else:
+        await update.message.reply_text(
+            text, reply_markup=InlineKeyboardMarkup(buttons)
+        )
+    return TPL_THEME_SELECT
+
+
+async def tpl_theme_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    theme = query.data.split(":")[1]
+    setup = _get_setup(context)
+
+    if theme == "free":
+        setup["template_bg_path"] = None
+        return await _ask_stars(update, context)
+
+    setup["ai_theme"] = theme
+
+    # Check credits/trial
+    from billing import get_or_create_user, can_generate_ai_bg, is_trial_active
+
+    user = get_or_create_user(update.effective_user.id)
+
+    if not user.get("trial_start"):
+        # First time — offer trial
+        buttons = [
+            [InlineKeyboardButton("Start Free Trial (3 days)", callback_data="ai_gen:trial")],
+            [InlineKeyboardButton("Skip (Free Gradient)", callback_data="ai_gen:skip")],
+        ]
+        text = (
+            "AI backgrounds are a premium feature.\n\n"
+            "Start a 3-day free trial to try them out!"
+        )
+    elif can_generate_ai_bg(user)[0]:
+        allowed, reason = can_generate_ai_bg(user)
+        buttons = [
+            [InlineKeyboardButton("Generate AI Background", callback_data="ai_gen:go")],
+            [InlineKeyboardButton("Skip (Free Gradient)", callback_data="ai_gen:skip")],
+        ]
+        text = f"Generate AI background?\n{reason}"
+    else:
+        _, reason = can_generate_ai_bg(user)
+        buttons = [
+            [InlineKeyboardButton("Buy Credits (/buy)", callback_data="ai_gen:buy")],
+            [InlineKeyboardButton("Skip (Free Gradient)", callback_data="ai_gen:skip")],
+        ]
+        text = f"{reason}\n\nUse /buy to purchase credits."
+
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    return TPL_AI_CONFIRM
+
+
+async def tpl_ai_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":")[1]
+    setup = _get_setup(context)
+
+    if choice == "skip":
+        setup["template_bg_path"] = None
+        return await _ask_stars(update, context)
+
+    if choice == "buy":
+        await query.edit_message_text("Use /buy to purchase credits, then run /setup again.")
+        _set_setup(context, {})
+        return ConversationHandler.END
+
+    # Start trial or deduct credit
+    from billing import (
+        get_or_create_user, start_trial, is_trial_active,
+        has_active_subscription, deduct_credit, can_generate_ai_bg,
+    )
+
+    user = get_or_create_user(update.effective_user.id)
+    credit_deducted = False
+
+    if choice == "trial":
+        start_trial(update.effective_user.id)
+    elif choice == "go":
+        allowed, _ = can_generate_ai_bg(user)
+        if not allowed:
+            await query.edit_message_text("No credits available. Use /buy to purchase.")
+            _set_setup(context, {})
+            return ConversationHandler.END
+        # Deduct only if not on trial and not subscription
+        if not is_trial_active(user):
+            credit_deducted = deduct_credit(update.effective_user.id)
+
+    # Generate AI background
+    await query.edit_message_text("Generating AI background... (15-30 seconds)")
+    try:
+        from ai_background import generate_ai_background, upload_ai_background
+
+        accent = setup.get("accent_color", "#00CCFF")
+        theme = setup.get("ai_theme", "abstract")
+        bg_bytes = generate_ai_background(theme, accent)
+        bg_path = upload_ai_background(setup["group_id"], bg_bytes)
+        setup["template_bg_path"] = bg_path
+
+        await query.from_user.send_photo(
+            photo=bg_bytes, caption="AI background generated!"
+        )
+    except Exception:
+        logger.exception("AI background generation failed")
+        setup["template_bg_path"] = None
+        # Refund credit if we deducted one
+        if credit_deducted:
+            from billing import add_credits
+            add_credits(update.effective_user.id, 1)
+        await query.from_user.send_message(
+            "AI generation failed. Using free gradient instead.\n"
+            "Your credit was not deducted."
+        )
+
     return await _ask_stars(update, context)
 
 
@@ -550,6 +695,7 @@ async def tpl_contact_li(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "contact_telegram": setup.get("contact_telegram"),
         "contact_instagram": setup.get("contact_instagram"),
         "contact_linkedin": setup.get("contact_linkedin"),
+        "template_bg_path": setup.get("template_bg_path"),
         "title": setup.get("group_title", ""),
     }
     watermarked = apply_watermark(sample, preview_config)
@@ -593,6 +739,7 @@ async def tpl_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "contact_telegram": setup.get("contact_telegram"),
         "contact_instagram": setup.get("contact_instagram"),
         "contact_linkedin": setup.get("contact_linkedin"),
+        "template_bg_path": setup.get("template_bg_path"),
     }
     if "logo_path" in setup:
         updates["logo_path"] = setup["logo_path"]
@@ -643,6 +790,9 @@ def build_setup_handler() -> ConversationHandler:
             TPL_CONTACT_IG: [MessageHandler(filters.TEXT & ~filters.COMMAND, tpl_contact_ig)],
             TPL_CONTACT_LI: [MessageHandler(filters.TEXT & ~filters.COMMAND, tpl_contact_li)],
             TPL_CONFIRM_PREVIEW: [CallbackQueryHandler(tpl_confirm_cb, pattern=r"^tpl_confirm:")],
+            # AI background states
+            TPL_THEME_SELECT: [CallbackQueryHandler(tpl_theme_cb, pattern=r"^theme:")],
+            TPL_AI_CONFIRM: [CallbackQueryHandler(tpl_ai_confirm_cb, pattern=r"^ai_gen:")],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False,
